@@ -90,6 +90,11 @@ const accountService = {
 
 		accountRow = await orm(c).insert(account).values({ email: email, userId: userId, name: emailUtils.getName(email) }).returning().get();
 
+		// Mail that arrived before this address existed was stored ownerless
+		// (user_id 0), which no per-user listing can ever return. Hand it over
+		// now so creating the address surfaces its backlog instead of losing it.
+		await emailService.claimOrphanEmails(c, email, userId, accountRow.accountId);
+
 		if (addEmailVerify === settingConst.addEmailVerify.COUNT && !addVerifyOpen) {
 			const row = await verifyRecordService.increaseAddCount(c);
 			addVerifyOpen = row.count >= addVerifyCount

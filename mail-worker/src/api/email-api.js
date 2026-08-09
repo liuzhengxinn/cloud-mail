@@ -14,9 +14,33 @@ app.get('/email/latest', async (c) => {
 	return c.json(result.ok(list));
 });
 
+/** Recycle bin: received mail with isDel = DELETE. Same `{list}` shape as star/list. */
+app.get('/email/deletedList', async (c) => {
+	const data = await emailService.deletedList(c, c.req.query(), userContext.getUserId(c));
+	return c.json(result.ok(data));
+});
+
 app.delete('/email/delete', async (c) => {
 	await emailService.delete(c, c.req.query(), userContext.getUserId(c));
 	return c.json(result.ok());
+});
+
+/** Move mail back out of the recycle bin. */
+app.put('/email/restore', async (c) => {
+	await emailService.restore(c, await c.req.json(), userContext.getUserId(c));
+	return c.json(result.ok());
+});
+
+/** Permanently drop mail and release the storage its attachments hold. */
+app.delete('/email/deleteForever', async (c) => {
+	const data = await emailService.deleteForever(c, c.req.query(), userContext.getUserId(c));
+	return c.json(result.ok(data));
+});
+
+/** Empty the whole recycle bin for the caller. */
+app.delete('/email/emptyTrash', async (c) => {
+	const data = await emailService.emptyTrash(c, userContext.getUserId(c));
+	return c.json(result.ok(data));
 });
 
 app.get('/email/attList', async (c) => {

@@ -25,3 +25,7 @@ mail-vue/node_modules
 mail-vue/dist
 .wrangler
 .venv
+
+# Local deploy config (account-scoped resource ids)
+wrangler.deploy.toml
+mail-worker/wrangler.deploy.toml

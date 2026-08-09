@@ -22,6 +22,10 @@ import domainUtils from '../utils/domain-uitls';
 import account from "../entity/account";
 import { att } from '../entity/att';
 import telegramService from './telegram-service';
+import pushService from './push-service';
+
+/** How long deleted mail is kept before the daily cron drops it for good. */
+export const TRASH_RETAIN_DAYS = 30;
 
 const emailService = {
 
@@ -134,6 +138,47 @@ const emailService = {
 		return { list, total: totalRow.total, latestEmail };
 	},
 
+	/**
+	 * Recycle bin listing: same shape as `list`, but only received mail whose
+	 * isDel is DELETE. Keyset-paginated on emailId like every other list here.
+	 */
+	async deletedList(c, params, userId) {
+
+		let { emailId, accountId, size, allReceive } = params;
+
+		size = Number(size);
+		emailId = Number(emailId);
+		accountId = Number(accountId);
+		allReceive = Number(allReceive);
+
+		if (!size || size > 50) size = 30;
+		if (!emailId) emailId = 9999999999;
+		if (isNaN(allReceive)) allReceive = 1;
+		if (isNaN(accountId)) accountId = 0;
+
+		const list = await orm(c).select().from(email).where(
+			and(
+				allReceive ? eq(1, 1) : eq(email.accountId, accountId),
+				eq(email.userId, userId),
+				lt(email.emailId, emailId),
+				eq(email.type, emailConst.type.RECEIVE),
+				eq(email.isDel, isDel.DELETE)
+			)
+		).orderBy(desc(email.emailId)).limit(size).all();
+
+		const attsList = list.length
+			? await attService.selectByEmailIds(c, list.map(row => row.emailId))
+			: [];
+
+		list.forEach(row => {
+			row.isStar = 0;
+			row.attList = attsList.filter(a => a.emailId === row.emailId);
+			row.expireTime = this.trashExpireTime(row.createTime);
+		});
+
+		return { list, retainDays: TRASH_RETAIN_DAYS };
+	},
+
 	async delete(c, params, userId) {
 		const { emailIds } = params;
 		const emailIdList = emailIds.split(',').map(Number);
@@ -142,6 +187,136 @@ const emailService = {
 				eq(email.userId, userId),
 				inArray(email.emailId, emailIdList)))
 			.run();
+	},
+
+	/** Move mail back out of the recycle bin. */
+	async restore(c, params, userId) {
+		const { emailIds } = params;
+		const emailIdList = (Array.isArray(emailIds) ? emailIds : String(emailIds).split(','))
+			.map(Number)
+			.filter(id => !isNaN(id));
+		if (!emailIdList.length) return;
+		await orm(c).update(email).set({ isDel: isDel.NORMAL }).where(
+			and(
+				eq(email.userId, userId),
+				eq(email.isDel, isDel.DELETE),
+				inArray(email.emailId, emailIdList)))
+			.run();
+	},
+
+	/**
+	 * Permanently drop mail the caller owns, together with its stars and its
+	 * attachments. Scoped to isDel = DELETE so a stray call can never wipe live
+	 * mail — permanent deletion is only ever reachable from the recycle bin.
+	 */
+	async deleteForever(c, params, userId) {
+		const { emailIds } = params;
+		const requested = (Array.isArray(emailIds) ? emailIds : String(emailIds).split(','))
+			.map(Number)
+			.filter(id => !isNaN(id));
+		if (!requested.length) return { deleted: 0 };
+
+		const rows = await orm(c).select({ emailId: email.emailId }).from(email).where(
+			and(
+				eq(email.userId, userId),
+				eq(email.isDel, isDel.DELETE),
+				inArray(email.emailId, requested)))
+			.all();
+
+		return { deleted: await this.purgeEmailRows(c, rows.map(r => r.emailId)) };
+	},
+
+	/** Permanently drop everything currently in the caller's recycle bin. */
+	async emptyTrash(c, userId) {
+		const rows = await orm(c).select({ emailId: email.emailId }).from(email).where(
+			and(
+				eq(email.userId, userId),
+				eq(email.isDel, isDel.DELETE)))
+			.all();
+
+		return { deleted: await this.purgeEmailRows(c, rows.map(r => r.emailId)) };
+	},
+
+	/**
+	 * Hard-delete email rows plus everything hanging off them.
+	 *
+	 * attService.removeByEmailIds drops the attachment rows and deletes the
+	 * underlying R2/KV objects, but only for keys no other mail still
+	 * references — attachments are content-addressed, so the same file sent
+	 * twice is one stored object shared by two rows.
+	 */
+	async purgeEmailRows(c, emailIds) {
+		if (!emailIds || !emailIds.length) return 0;
+
+		const BATCH = 200;
+		for (let i = 0; i < emailIds.length; i += BATCH) {
+			const batch = emailIds.slice(i, i + BATCH);
+			await attService.removeByEmailIds(c, batch);
+			await orm(c).delete(star).where(inArray(star.emailId, batch)).run();
+			await orm(c).delete(email).where(inArray(email.emailId, batch)).run();
+		}
+		return emailIds.length;
+	},
+
+	/**
+	 * Scheduled cleanup: anything that has sat in a recycle bin for longer than
+	 * TRASH_RETAIN_DAYS is dropped for good, freeing its attachment storage.
+	 */
+	async purgeExpiredTrash(c) {
+		const cutoff = dayjs().subtract(TRASH_RETAIN_DAYS, 'day').format('YYYY-MM-DD HH:mm:ss');
+		const rows = await orm(c).select({ emailId: email.emailId }).from(email).where(
+			and(
+				eq(email.isDel, isDel.DELETE),
+				lt(email.createTime, cutoff)))
+			.limit(2000)
+			.all();
+
+		if (!rows.length) return 0;
+		return await this.purgeEmailRows(c, rows.map(r => r.emailId));
+	},
+
+	trashExpireTime(createTime) {
+		if (!createTime) return null;
+		return dayjs(createTime).add(TRASH_RETAIN_DAYS, 'day').format('YYYY-MM-DD HH:mm:ss');
+	},
+
+	/**
+	 * Adopt mail that was delivered to `address` while no account owned it.
+	 *
+	 * Inbound mail for an unknown recipient is still stored (unless noRecipient
+	 * is closed) but with user_id/account_id 0, and every listing filters by
+	 * user_id — so it is invisible to everyone. Creating the address later is
+	 * the natural moment to hand that backlog to its owner, attachments and all.
+	 */
+	async claimOrphanEmails(c, address, userId, accountId) {
+
+		const rows = await orm(c).select({ emailId: email.emailId }).from(email).where(
+			and(
+				eq(email.userId, 0),
+				eq(email.type, emailConst.type.RECEIVE),
+				sql`${email.toEmail} COLLATE NOCASE = ${address}`))
+			.all();
+
+		if (!rows.length) return 0;
+
+		const emailIds = rows.map(r => r.emailId);
+
+		await orm(c).update(email)
+			.set({
+				userId,
+				accountId,
+				// NOONE marked them as undeliverable; they are real inbox mail now.
+				status: emailConst.status.RECEIVE
+			})
+			.where(inArray(email.emailId, emailIds))
+			.run();
+
+		await orm(c).update(att)
+			.set({ userId, accountId })
+			.where(inArray(att.emailId, emailIds))
+			.run();
+
+		return emailIds.length;
 	},
 
 	receive(c, params, cidAttList, r2domain) {
@@ -618,9 +793,12 @@ const emailService = {
 		//保存邮件
 		const receiveEmailList = emailDataList.filter(emailRow => emailRow.status === emailConst.status.RECEIVE || emailRow.status === emailConst.status.NOONE);
 
+		const insertedRows = [];
+
 		for (const emailData of receiveEmailList) {
 
 			const emailRow = await orm(c).insert(email).values(emailData).returning().get();
+			insertedRows.push(emailRow);
 
 			//设置附件保存
 			for (const attRow of attList) {
@@ -633,6 +811,11 @@ const emailService = {
 			}
 
 		}
+
+		// Push for on-site delivery. Without this only mail arriving from outside
+		// (via the Cloudflare Email handler) ever notified, so two accounts on the
+		// same instance mailing each other were silently delivered.
+		await pushService.pushNewEmails(c, insertedRows);
 
 		const bouncedEmail = emailDataList.find(emailRow => emailRow.status === emailConst.status.BOUNCED);
 
